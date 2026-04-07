@@ -34,6 +34,12 @@ CUT_OFF[2] = 0.05
 RES_FAC = np.array([50, 50, 250])
 WINDOW_LENGTHS = np.array([100, 100, 50], int)  # window lengths for local maximum
 
+# Bass harmonic inference parameters
+# Piano bass notes (A0-G#2) have weak fundamentals but strong harmonics.
+# Detect bass onsets via coincident 2nd (octave) + 3rd (octave+fifth) harmonic onsets.
+BASS_HARMONIC_THRESHOLD = 45  # MIDI pitch below which to use harmonic inference (A2)
+BASS_HARMONIC_WINDOW_MS = 50  # Harmonics must onset within this window to be considered coincident
+
 
 def audio_to_pitch_onset_features(f_audio: np.ndarray,
                                   Fs: float = 22050,
@@ -43,7 +49,8 @@ def audio_to_pitch_onset_features(f_audio: np.ndarray,
                                   manual_offset: float = -25,
                                   verbose: bool = False,
                                   visualization_title: str = "Pitch onset features",
-                                  visualization_log_gamma: float = 100.0) -> dict:
+                                  visualization_log_gamma: float = 100.0,
+                                  bass_harmonic_inference: bool = False) -> dict:
     """Computes pitch onset features based on an IIR filterbank. The signal is decomposed
     into subbands that correspond to MIDI pitches between midi_min and midi_max.
     After that, onsets for each MIDI pitch are calculated.
@@ -80,6 +87,11 @@ def audio_to_pitch_onset_features(f_audio: np.ndarray,
 
     visualization_log_gamma : float
         Log compression gamma parameter for visualization. (relevant only if ``verbose`` is True.
+
+    bass_harmonic_inference : bool
+        If True, infer bass fundamental onsets (MIDI < 45) from coincident 2nd and 3rd
+        harmonic onsets. Piano bass notes have weak fundamentals that often fail direct
+        detection, but their harmonics are strong. Default False for backward compatibility.
 
     Returns
     -------
@@ -171,6 +183,11 @@ def audio_to_pitch_onset_features(f_audio: np.ndarray,
             val_peaks = val_peaks[non_negative_indices]
 
         f_peaks[midi_pitch] = np.array([time_peaks, val_peaks])
+
+    # Infer bass fundamental onsets from harmonic coincidence
+    # (bass fundamentals often have weak energy that fails direct detection)
+    if bass_harmonic_inference:
+        f_peaks = _infer_bass_from_harmonics(f_peaks, midi_min=midi_min)
 
     if verbose:
         print("")
@@ -324,3 +341,89 @@ def __find_peaks_jit_helper(W, abs_thresh, descent_thresh, dir, range, rel_thres
         dyold = dy
     peaks = np.array(peaks_list, np.float64)
     return peaks
+
+
+def _infer_bass_from_harmonics(f_peaks: dict,
+                                midi_min: int = 21,
+                                threshold_midi: int = BASS_HARMONIC_THRESHOLD,
+                                window_ms: float = BASS_HARMONIC_WINDOW_MS,
+                                min_magnitude_threshold: float = 1e-4) -> dict:
+    """Infer bass fundamental onsets from coincident harmonic onsets.
+
+    Piano bass notes (roughly A0 to G#2) have weak fundamentals that often
+    fail detection, but their 2nd and 3rd harmonics are strong. When both
+    harmonics onset together, we can infer the fundamental was struck.
+
+    Only augments peaks where the original detection gave zero or near-zero
+    magnitude, preserving valid detections.
+
+    Parameters
+    ----------
+    f_peaks : dict
+        Peak dictionary from audio_to_pitch_onset_features.
+
+    midi_min : int
+        Minimum MIDI pitch to process.
+
+    threshold_midi : int
+        MIDI pitches below this use harmonic inference (default 45 = A2).
+
+    window_ms : float
+        Maximum time gap (ms) between harmonic onsets to consider coincident.
+
+    min_magnitude_threshold : float
+        Original peaks with magnitude above this are kept; below are augmented.
+
+    Returns
+    -------
+    f_peaks : dict
+        Updated peak dictionary with inferred bass onsets.
+    """
+    for bass_midi in range(midi_min, threshold_midi):
+        h2_midi = bass_midi + 12  # 2nd harmonic (octave up)
+        h3_midi = bass_midi + 19  # 3rd harmonic (octave + perfect fifth)
+
+        if h2_midi not in f_peaks or h3_midi not in f_peaks:
+            continue
+
+        # Check if original detection already has good peaks
+        if bass_midi in f_peaks:
+            orig_mags = np.asarray(f_peaks[bass_midi][1]).ravel()
+            if len(orig_mags) > 0 and np.max(orig_mags) > min_magnitude_threshold:
+                # Original detection worked, keep it
+                continue
+
+        h2_data = f_peaks[h2_midi]
+        h3_data = f_peaks[h3_midi]
+
+        # Handle varying array shapes from peak detection
+        h2_times = np.asarray(h2_data[0]).ravel()
+        h2_mags = np.asarray(h2_data[1]).ravel()
+        h3_times = np.asarray(h3_data[0]).ravel()
+        h3_mags = np.asarray(h3_data[1]).ravel()
+
+        if len(h2_times) == 0 or len(h3_times) == 0:
+            continue
+
+        inferred_times = []
+        inferred_mags = []
+
+        # For each 2nd harmonic onset, look for coincident 3rd harmonic
+        for i, t2 in enumerate(h2_times):
+            time_diffs = np.abs(h3_times - t2)
+            matches = np.where(time_diffs < window_ms)[0]
+
+            if len(matches) > 0:
+                # Use closest match
+                j = matches[np.argmin(time_diffs[matches])]
+                # Inferred onset time = average of harmonic times
+                inferred_t = (t2 + h3_times[j]) / 2
+                # Inferred magnitude = sum of harmonic magnitudes
+                inferred_mag = h2_mags[i] + h3_mags[j]
+                inferred_times.append(inferred_t)
+                inferred_mags.append(inferred_mag)
+
+        if inferred_times:
+            f_peaks[bass_midi] = np.array([inferred_times, inferred_mags])
+
+    return f_peaks
