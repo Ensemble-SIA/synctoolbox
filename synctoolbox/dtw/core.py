@@ -2,6 +2,32 @@ import librosa
 from numba import jit
 import numpy as np
 
+# Ensemble fork-patch 2026-04-24: DTW2 reachability fallback instrumentation.
+# See docs/UPSTREAM_MODIFICATIONS.md in the ensemble repo for rationale.
+# When compute_warping_path is called with a step set that leaves the end
+# cell unreachable (e.g., DTW2 [[1,1],[1,2],[2,1]] on small cost matrices
+# where N-1 + M-1 == 1 or a single dimension is 1), we fall back to DTW4
+# for that sub-problem and record the fallback.
+_DTW4_STEP_SIZES = np.array([[1, 0], [0, 1], [1, 1]], np.int64)
+_DTW4_STEP_WEIGHTS = np.array([1.0, 1.0, 1.0], np.float64)
+_dtw_fallback_stats = {"total": 0, "fallback": 0}
+
+
+def get_dtw_fallback_stats():
+    """Return cumulative (total_calls, fallback_calls) counters.
+
+    Ensemble fork addition. Counts every compute_warping_path invocation and
+    how many fell back to DTW4 because the requested step set left the end
+    cell unreachable.
+    """
+    return dict(_dtw_fallback_stats)
+
+
+def reset_dtw_fallback_stats():
+    """Zero the fallback counters. Useful between recordings/test runs."""
+    _dtw_fallback_stats["total"] = 0
+    _dtw_fallback_stats["fallback"] = 0
+
 
 @jit(nopython=True, cache=True)
 def __C_to_DE(C: np.ndarray = None,
@@ -192,6 +218,21 @@ def compute_warping_path(C: np.ndarray,
                          dm=dm,
                          dw=step_weights,
                          sub_sequence=False)
+
+        # Ensemble fork-patch 2026-04-24: DTW2 reachability fallback.
+        # Step sets without pure (1,0)/(0,1) leave some cells unreachable;
+        # if D[-1, -1] is inf, backtrack would segfault via E[n,m] == -1.
+        # Fall back to DTW4 on this sub-problem and record the event.
+        _dtw_fallback_stats["total"] += 1
+        if not np.isfinite(D[-1, -1]):
+            _dtw_fallback_stats["fallback"] += 1
+            dn = _DTW4_STEP_SIZES[:, 0]
+            dm = _DTW4_STEP_SIZES[:, 1]
+            D, E = __C_to_DE(C,
+                             dn=dn,
+                             dm=dm,
+                             dw=_DTW4_STEP_WEIGHTS,
+                             sub_sequence=False)
 
         wp = __E_to_warping_path(E=E,
                                  dn=dn,
