@@ -2,31 +2,20 @@ import librosa
 from numba import jit
 import numpy as np
 
-# Ensemble fork-patch 2026-04-24: DTW2 reachability fallback instrumentation.
+# Ensemble fork-patch 2026-04-24: DTW2 reachability fallback.
 # See docs/UPSTREAM_MODIFICATIONS.md in the ensemble repo for rationale.
 # When compute_warping_path is called with a step set that leaves the end
 # cell unreachable (e.g., DTW2 [[1,1],[1,2],[2,1]] on small cost matrices
-# where N-1 + M-1 == 1 or a single dimension is 1), we fall back to DTW4
-# for that sub-problem and record the fallback.
+# where N-1 + M-1 == 1 or a single dimension is 1), the forward pass leaves
+# D[-1, -1] = inf; the subsequent backtrack then dereferences E[-1, -1] == -1
+# and numba wraps the negative step index, walking the path out of bounds
+# and segfaulting. We detect `inf` at D[-1, -1] and fall back to DTW4 for
+# that single sub-problem. Callers that want visibility into fallback
+# frequency should record it via the trace system at their call site —
+# this module does NOT keep a module-level counter (invariant 15: no
+# global mutable state that would race under concurrent pipelines).
 _DTW4_STEP_SIZES = np.array([[1, 0], [0, 1], [1, 1]], np.int64)
 _DTW4_STEP_WEIGHTS = np.array([1.0, 1.0, 1.0], np.float64)
-_dtw_fallback_stats = {"total": 0, "fallback": 0}
-
-
-def get_dtw_fallback_stats():
-    """Return cumulative (total_calls, fallback_calls) counters.
-
-    Ensemble fork addition. Counts every compute_warping_path invocation and
-    how many fell back to DTW4 because the requested step set left the end
-    cell unreachable.
-    """
-    return dict(_dtw_fallback_stats)
-
-
-def reset_dtw_fallback_stats():
-    """Zero the fallback counters. Useful between recordings/test runs."""
-    _dtw_fallback_stats["total"] = 0
-    _dtw_fallback_stats["fallback"] = 0
 
 
 @jit(nopython=True, cache=True)
@@ -222,10 +211,10 @@ def compute_warping_path(C: np.ndarray,
         # Ensemble fork-patch 2026-04-24: DTW2 reachability fallback.
         # Step sets without pure (1,0)/(0,1) leave some cells unreachable;
         # if D[-1, -1] is inf, backtrack would segfault via E[n,m] == -1.
-        # Fall back to DTW4 on this sub-problem and record the event.
-        _dtw_fallback_stats["total"] += 1
+        # Fall back to DTW4 on this sub-problem. No module-level counter —
+        # callers record fallback frequency via their trace infrastructure
+        # if they want visibility (invariant 15).
         if not np.isfinite(D[-1, -1]):
-            _dtw_fallback_stats["fallback"] += 1
             dn = _DTW4_STEP_SIZES[:, 0]
             dm = _DTW4_STEP_SIZES[:, 1]
             D, E = __C_to_DE(C,
