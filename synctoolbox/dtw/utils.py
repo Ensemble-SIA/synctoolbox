@@ -55,7 +55,8 @@ def compute_optimal_chroma_shift(f_chroma1: np.ndarray,
 def compute_warping_paths_from_cost_matrices(cost_matrices: List,
                                              step_sizes: np.array = np.array([[1, 0], [0, 1], [1, 1]], int),
                                              step_weights: np.array = np.array([1.0, 1.0, 1.0], np.float64),
-                                             implementation: str = 'synctoolbox') -> List:
+                                             implementation: str = 'synctoolbox',
+                                             recorder=None) -> List:
     """Computes a path via DTW on each matrix in cost_matrices
 
     Parameters
@@ -72,6 +73,12 @@ def compute_warping_paths_from_cost_matrices(cost_matrices: List,
     implementation : str
         Choose among 'synctoolbox' and 'librosa' (default: 'synctoolbox')
 
+    recorder : object or None
+        Ensemble fork-patch 2026-08-13 (pass-time surrender). Optional
+        write-only sink forwarded to ``compute_warping_path`` together with
+        each band's index. ``None`` (the default) leaves behavior untouched;
+        an attached recorder cannot change the returned paths.
+
     Returns
     -------
     wp_list : list
@@ -80,7 +87,10 @@ def compute_warping_paths_from_cost_matrices(cost_matrices: List,
     return [compute_warping_path(C=C,
                                  step_sizes=step_sizes,
                                  step_weights=step_weights,
-                                 implementation=implementation)[2] for C in cost_matrices]
+                                 implementation=implementation,
+                                 recorder=recorder,
+                                 band_index=band_index)[2]
+            for band_index, C in enumerate(cost_matrices)]
 
 
 def compute_cost_matrices_between_anchors(f_chroma1: np.ndarray,

@@ -161,7 +161,9 @@ def __E_to_warping_path(E: np.ndarray,
 def compute_warping_path(C: np.ndarray,
                          step_sizes: np.ndarray = np.array([[1, 0], [0, 1], [1, 1]], np.int64),
                          step_weights: np.ndarray = np.array([1.0, 1.0, 1.0], np.float64),
-                         implementation: str = 'synctoolbox'):
+                         implementation: str = 'synctoolbox',
+                         recorder=None,
+                         band_index: int = -1):
     """Applies DTW on cost matrix C.
 
     Parameters
@@ -178,6 +180,21 @@ def compute_warping_path(C: np.ndarray,
     implementation: str
         Choose among ``synctoolbox`` and ``librosa``. (default: ``synctoolbox``)
 
+    recorder : object or None
+        Ensemble fork-patch 2026-08-13 (pass-time surrender). Optional
+        write-only sink. When not ``None``, ``recorder.record_band(...)`` is
+        called once per solved sub-problem with the step set actually used and
+        whether the DTW4 reachability fallback fired. The recorder is never
+        read back and never influences a decision: with ``recorder=None`` this
+        function executes exactly the statements it did before, and with a
+        recorder attached the returned ``D``/``E``/``wp`` are byte-identical.
+        Passed explicitly rather than held module-level so concurrent
+        pipelines cannot race (ensemble architecture.md invariant 15).
+
+    band_index : int
+        Index of this sub-problem within its caller's band list, forwarded
+        verbatim to the recorder. ``-1`` means "the caller did not say".
+
     Returns
     -------
     D : np.ndarray (np.float64) [shape=(N, M)]
@@ -189,6 +206,8 @@ def compute_warping_path(C: np.ndarray,
     wp : np.ndarray (np.int64) [shape=(2, M)]
         Warping path
     """
+    reachability_fallback = False
+
     if implementation == 'librosa':
         D, wp, E = librosa.sequence.dtw(C=C,
                                         step_sizes_sigma=step_sizes,
@@ -197,6 +216,8 @@ def compute_warping_path(C: np.ndarray,
                                         return_steps=True,
                                         subseq=False)
         wp = wp[::-1].T
+        applied_step_sizes = step_sizes
+        applied_step_weights = step_weights
 
     elif implementation == 'synctoolbox':
         dn = step_sizes[:, 0]
@@ -208,15 +229,23 @@ def compute_warping_path(C: np.ndarray,
                          dw=step_weights,
                          sub_sequence=False)
 
+        applied_step_sizes = step_sizes
+        applied_step_weights = step_weights
+
         # Ensemble fork-patch 2026-04-24: DTW2 reachability fallback.
         # Step sets without pure (1,0)/(0,1) leave some cells unreachable;
         # if D[-1, -1] is inf, backtrack would segfault via E[n,m] == -1.
         # Fall back to DTW4 on this sub-problem. No module-level counter —
         # callers record fallback frequency via their trace infrastructure
-        # if they want visibility (invariant 15).
+        # if they want visibility (invariant 15). Ensemble fork-patch
+        # 2026-08-13: `recorder` below IS that trace infrastructure, supplied
+        # per call by the caller rather than held here.
         if not np.isfinite(D[-1, -1]):
+            reachability_fallback = True
             dn = _DTW4_STEP_SIZES[:, 0]
             dm = _DTW4_STEP_SIZES[:, 1]
+            applied_step_sizes = _DTW4_STEP_SIZES
+            applied_step_weights = _DTW4_STEP_WEIGHTS
             D, E = __C_to_DE(C,
                              dn=dn,
                              dm=dm,
@@ -252,6 +281,23 @@ def compute_warping_path(C: np.ndarray,
     if (np.diff(wp) < 0).any():
         raise ValueError('Warping path must be monotonically increasing. '
                          'Consider using another set of step sizes.')
+
+    # Ensemble fork-patch 2026-08-13 (pass-time surrender): hand the solved
+    # sub-problem to the caller's sink. Placed after every validation so a
+    # recorded band is always a band the algorithm accepted. Write-only — no
+    # return value is consulted, so this cannot alter D, E or wp.
+    if recorder is not None:
+        recorder.record_band(band_index=band_index,
+                             cost_matrix=C,
+                             accumulated_cost=D,
+                             step_index_matrix=E,
+                             warping_path=wp,
+                             implementation=implementation,
+                             requested_step_sizes=step_sizes,
+                             requested_step_weights=step_weights,
+                             applied_step_sizes=applied_step_sizes,
+                             applied_step_weights=applied_step_weights,
+                             reachability_fallback=reachability_fallback)
 
     return D, E, wp
 
