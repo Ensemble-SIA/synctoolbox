@@ -28,7 +28,8 @@ def sync_via_mrmsdtw_with_anchors(f_chroma1: np.ndarray,
                                   visualization_title: str = "MrMsDTW result",
                                   anchor_pairs: List[Tuple] = None,
                                   linear_inp_idx: List[int] = [],
-                                  alpha=0.5) -> np.ndarray:
+                                  alpha=0.5,
+                                  recorder=None) -> np.ndarray:
     """Compute memory-restricted multi-scale DTW (MrMsDTW) using chroma and (optionally) onset features.
         MrMsDTW is performed on multiple levels that get progressively finer, with rectangular constraint
         regions defined by the alignment found on the previous, coarser level.
@@ -112,6 +113,17 @@ def sync_via_mrmsdtw_with_anchors(f_chroma1: np.ndarray,
             Coefficient for the Chroma cost matrix in the finest scale of the MrMsDTW algorithm.
             C = alpha * C_Chroma + (1 - alpha) * C_act  (default: 0.5)
 
+        recorder : object or None
+            Ensemble fork-patch 2026-08-13 (pass-time surrender). Optional
+            write-only sink. When not ``None`` the anchored road reports every
+            interval it walks — its anchor boundaries, the split feature
+            shapes, and crucially whether the interval RAN DTW or was handed a
+            straight diagonal warping path because ``linear_inp_idx`` named it.
+            A diagonal interval is otherwise indistinguishable downstream from
+            a DTW-solved one: both arrive as ordinary warping-path columns in
+            the concatenated result. Nothing recorded is read back, so the
+            returned ``wp`` is byte-identical with and without a recorder.
+
         Returns
         -------
         wp : np.ndarray [shape=(2, T)]
@@ -134,7 +146,8 @@ def sync_via_mrmsdtw_with_anchors(f_chroma1: np.ndarray,
                               chroma_norm_ord=chroma_norm_ord,
                               chroma_norm_threshold=chroma_norm_threshold,
                               visualization_title=visualization_title,
-                              alpha=alpha)
+                              alpha=alpha,
+                              recorder=recorder)
     else:
         # constant_intervals = [((0,  x1), (0, y1), False),
         #                       ((x1, x2), (y1, y2), True),
@@ -166,7 +179,28 @@ def sync_via_mrmsdtw_with_anchors(f_chroma1: np.ndarray,
                                                                                                 prev_a2,
                                                                                                 input_feature_rate)
 
-            if idx in linear_inp_idx or idx == len(anchor_pairs) - 1 and -1 in linear_inp_idx:
+            # Ensemble fork-patch 2026-08-13 (pass-time surrender): the
+            # diagonal/DTW decision is computed once, named, and reported.
+            # Upstream evaluated this predicate inline in the `if`, so the
+            # fact that an interval skipped DTW entirely left no trace at all
+            # once the paths were concatenated.
+            diagonal_interval = bool(idx in linear_inp_idx
+                                     or idx == len(anchor_pairs) - 1 and -1 in linear_inp_idx)
+
+            if recorder is not None:
+                recorder.open_interval(interval_index=idx,
+                                       prev_a1=prev_a1,
+                                       prev_a2=prev_a2,
+                                       cur_a1=cur_a1,
+                                       cur_a2=cur_a2,
+                                       is_final_interval=bool(idx == len(anchor_pairs) - 1),
+                                       diagonal_interval=diagonal_interval,
+                                       linear_inp_idx=list(linear_inp_idx),
+                                       f_chroma1_split_shape=tuple(f_chroma1_split.shape),
+                                       f_chroma2_split_shape=tuple(f_chroma2_split.shape),
+                                       input_feature_rate=input_feature_rate)
+
+            if diagonal_interval:
                 # Generate a diagonal warping path, if the algorithm is not supposed to executed.
                 # A typical scenario is the silence breaks which are enclosed by two anchor points.
                 if verbose:
@@ -197,7 +231,17 @@ def sync_via_mrmsdtw_with_anchors(f_chroma1: np.ndarray,
                                           normalize_chroma=normalize_chroma,
                                           chroma_norm_ord=chroma_norm_ord,
                                           chroma_norm_threshold=chroma_norm_threshold,
-                                          alpha=alpha)
+                                          alpha=alpha,
+                                          recorder=recorder)
+
+            # Ensemble fork-patch 2026-08-13: the interval's own path, before
+            # it is offset and welded into the running concatenation — the only
+            # point at which a per-interval trajectory is separable.
+            if recorder is not None:
+                recorder.close_interval(interval_index=idx,
+                                        interval_warping_path=wp_cur,
+                                        concatenation_offset=(None if wp is None
+                                                              else wp[:, -1].copy()))
 
             if wp is None:
                 wp = np.array(wp_cur, copy=True)
@@ -230,7 +274,8 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
                      chroma_norm_ord: int = 2,
                      chroma_norm_threshold: float = 0.001,
                      visualization_title: str = "MrMsDTW result",
-                     alpha=0.5) -> np.ndarray:
+                     alpha=0.5,
+                     recorder=None) -> np.ndarray:
     """Compute memory-restricted multi-scale DTW (MrMsDTW) using chroma and (optionally) onset features.
         MrMsDTW is performed on multiple levels that get progressively finer, with rectangular constraint
         regions defined by the alignment found on the previous, coarser level.
@@ -297,6 +342,18 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
             Coefficient for the Chroma cost matrix in the finest scale of the MrMsDTW algorithm.
             C = alpha * C_Chroma + (1 - alpha) * C_act  (default: 0.5)
 
+        recorder : object or None
+            Ensemble fork-patch 2026-08-13 (pass-time surrender). Optional
+            write-only sink. When not ``None`` the multiscale loop reports, per
+            scale: the smoothing/downsampling parameters actually applied, the
+            anchor set, the cost matrices of both refinement steps (coarsest
+            scale first, then the banded fine scales), the per-band warping
+            paths and their step sets, and the path trajectory before and after
+            refinement. It also reports the single-scale short-circuit taken
+            when the full cost-matrix area falls under ``threshold_rec``.
+            Every call is one-way: no recorded value is read back, so
+            ``alignment`` is byte-identical with and without a recorder.
+
         Returns
         -------
         alignment: np.ndarray [shape=(2, T)]
@@ -321,7 +378,32 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
     total_computation_time = 0.0
 
     # If the area is less than the threshold_rec, don't apply the multiscale DTW.
-    it = (num_iterations - 1) if __compute_area(f_chroma1, f_chroma2) < threshold_rec else 0
+    full_area = __compute_area(f_chroma1, f_chroma2)
+    it = (num_iterations - 1) if full_area < threshold_rec else 0
+
+    # Ensemble fork-patch 2026-08-13 (pass-time surrender): report the shape of
+    # the pass before any scale runs — including the single-scale short-circuit
+    # above, which upstream takes silently.
+    if recorder is not None:
+        recorder.open_pass(num_iterations=num_iterations,
+                           first_iteration=it,
+                           full_area=int(full_area),
+                           threshold_rec=threshold_rec,
+                           single_scale_shortcut=bool(it == num_iterations - 1
+                                                      and num_iterations > 1),
+                           high_res=high_res,
+                           input_feature_rate=input_feature_rate,
+                           win_len_smooth=np.asarray(win_len_smooth).tolist(),
+                           downsamp_smooth=np.asarray(downsamp_smooth).tolist(),
+                           step_sizes=np.asarray(step_sizes).tolist(),
+                           step_weights=np.asarray(step_weights).tolist(),
+                           alpha=alpha,
+                           normalize_chroma=normalize_chroma,
+                           chroma_norm_ord=chroma_norm_ord,
+                           chroma_norm_threshold=chroma_norm_threshold,
+                           dtw_implementation=dtw_implementation,
+                           f_chroma1_shape=tuple(f_chroma1.shape),
+                           f_chroma2_shape=tuple(f_chroma2.shape))
 
     while it < num_iterations:
         tic1 = time.perf_counter()
@@ -380,14 +462,35 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
                                                                         anchors=anchors,
                                                                         alpha=alpha)
 
+        # Ensemble fork-patch 2026-08-13 (pass-time surrender): open the scale
+        # and its step-1 phase so each band solved inside
+        # ``compute_warping_path`` is attributable to this scale.
+        if recorder is not None:
+            recorder.open_scale(iteration=it,
+                                win_len_smooth=int(win_len_smooth[it]),
+                                downsamp_smooth=int(downsamp_smooth[it]),
+                                feature_rate=float(feature_rate_new),
+                                is_finest=bool(it == num_iterations - 1),
+                                cost_matrix_size=cost_matrix_size_new,
+                                f_chroma1_cur_shape=tuple(f_chroma1_cur.shape),
+                                f_chroma2_cur_shape=tuple(f_chroma2_cur.shape))
+            recorder.open_phase(phase='step1',
+                                anchors=anchors,
+                                cost_matrices=cost_matrices_step1,
+                                onset_informed=bool(high_res and it == num_iterations - 1))
+
         wp_list = compute_warping_paths_from_cost_matrices(cost_matrices_step1,
                                                            step_sizes=step_sizes,
                                                            step_weights=step_weights,
-                                                           implementation=dtw_implementation)
+                                                           implementation=dtw_implementation,
+                                                           recorder=recorder)
 
         # Concatenate warping paths
         wp = build_path_from_warping_paths(warping_paths=wp_list,
                                            anchors=anchors)
+
+        if recorder is not None:
+            recorder.close_phase(phase='step1', warping_path=wp)
 
         anchors_step1 = None
         wp_step1 = None
@@ -430,16 +533,32 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
                                                                         anchors=neighboring_anchors,
                                                                         alpha=alpha)
 
+        if recorder is not None:
+            recorder.open_phase(phase='step2',
+                                anchors=neighboring_anchors,
+                                cost_matrices=cost_matrices_step2,
+                                onset_informed=bool(neighboring_anchor_indices.shape[0] > 1
+                                                    and it == num_iterations - 1 and high_res),
+                                anchor_indices_in_warping_path=anchor_indices_in_warping_path,
+                                neighboring_anchor_indices=neighboring_anchor_indices)
+
         wp_list_refine = compute_warping_paths_from_cost_matrices(cost_matrices=cost_matrices_step2,
                                                                   step_sizes=step_sizes,
                                                                   step_weights=step_weights,
-                                                                  implementation=dtw_implementation)
+                                                                  implementation=dtw_implementation,
+                                                                  recorder=recorder)
 
         wp = __refine_wp(wp, anchors, wp_list_refine, neighboring_anchors, neighboring_anchor_indices)
 
         toc2 = time.perf_counter()
         computation_time_it = toc2 - tic2 + toc1 - tic1
         total_computation_time += computation_time_it
+
+        if recorder is not None:
+            recorder.close_phase(phase='step2', warping_path=wp)
+            recorder.close_scale(iteration=it,
+                                 warping_path=wp,
+                                 computation_time_sec=computation_time_it)
 
         alignment = wp
         feature_rate_old = feature_rate_new
@@ -461,6 +580,10 @@ def sync_via_mrmsdtw(f_chroma1: np.ndarray,
 
     if verbose:
         print('Computation time of MrMsDTW: {:.2f} seconds'.format(total_computation_time))
+
+    if recorder is not None:
+        recorder.close_pass(alignment=alignment,
+                            total_computation_time_sec=total_computation_time)
 
     return alignment
 
